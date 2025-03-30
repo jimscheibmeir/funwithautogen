@@ -1,0 +1,211 @@
+import os
+import asyncio
+import tweepy
+
+from flask import Flask, request, jsonify, render_template
+import autogen
+from autogen_ext.auth.azure import AzureTokenProvider
+from autogen_ext.models.azure import AzureAIChatCompletionClient
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.teams import MagenticOneGroupChat
+from autogen_agentchat.ui import Console
+from autogen_agentchat.teams import RoundRobinGroupChat
+from autogen_ext.models.openai import OpenAIChatCompletionClient
+from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
+from autogen_ext.agents.web_surfer import MultimodalWebSurfer
+from autogen import register_function
+from autogen import ConversableAgent
+from autogen_agentchat.base import TaskResult
+
+from dotenv import load_dotenv, find_dotenv
+from typing import Annotated, Literal
+
+
+#establish the Flask api app, setup the environment file for getting secrets for
+#our azure hosted LLM gpt4o model and X API for sending tweets
+app = Flask(__name__)
+
+os.chdir("<--to do--  where is your env file or where do you want screenshots saved,etc.>")
+os.environ["AZURE_OPENAI_KEY"] = os.getenv("AZURE_OPENAI_KEY")
+os.environ["OPENAI_API_BASE"] = os.getenv("OPENAI_API_BASE")
+os.environ["OPENAI_MODEL_NAME"] = os.getenv("OPENAI_MODEL_NAME")
+load_dotenv()
+load_dotenv(find_dotenv())
+
+# Start logging
+logging_session_id = autogen.runtime_logging.start(config={"file": "logs.txt"})
+
+config_list = [
+  {
+        "base_url": os.environ["OPENAI_API_BASE"],
+        "api_key": os.environ["AZURE_OPENAI_KEY"],
+        "api_version": "2024-08-01-preview",
+        "model": os.environ["OPENAI_MODEL_NAME"],
+        "api_type": "azure",
+  }
+]
+
+
+#The multimodalwebsurfer has a guardrail that doesn't let it send tweets.
+#So I built a function to do the same thing.  It uses they tweepy library and APIs
+#into X directly.  This function is then a tool for our agents to utilize
+def sendMsg(msg: str) -> str:
+  app.logger.info("Inside send but outside of try catch.")
+  try:
+    app.logger.info("An info message: inside send function try")
+
+    client = tweepy.Client(
+      bearer_token=os.getenv("twitter4"),
+      consumer_key=os.getenv("twitterCK"), 
+      consumer_secret=os.getenv("twitterCS"),
+      access_token=os.getenv("twitterAT"), 
+      access_token_secret=os.getenv("twitterATS")
+    )
+    response = client.create_tweet(text=msg)
+  except OSError as e:
+    app.logger.info("Exception in send")
+    
+
+#main is called when our API gets a post with a URL attached
+#it calls the first agent team that navigates to the article, reads and summarizes
+#and crafts the hashtags and tweet salutation
+#Then it calls the second team of agents to interface with X and send the tweet
+async def main(url: str):
+  try:
+
+    # setup our web surfer agent
+    #These agents can be headless or show and annotate the browser as it drives,
+    #which is great for development and debugging
+    web_surfer_agent = MultimodalWebSurfer(
+        name="MultimodalWebSurfer",
+        #to_save_screenshots=True,
+        headless=False,
+        animate_actions=True,
+        model_client=AzureOpenAIChatCompletionClient(
+          name="Jim",
+          azure_deployment=os.getenv("OPENAI_API_BASE"),
+          model=os.getenv("OPENAI_MODEL_NAME"),
+          api_version="2024-08-01-preview", #"2024-08-01-preview",
+          azure_endpoint=os.getenv("OPENAI_API_BASE"),
+          api_key=os.getenv("AZURE_OPENAI_KEY"),
+      ),
+    )
+    app.logger.info("An info message: wsa was defined.")
+    #setup the tool caller
+    
+    #Our assistant agent drives the multimodalwebsurfer agent
+    #It gives it tasks like writing a summary and related hashtags for the tweet
+    #and can instruct it to keep trying or to send
+    #a terminate message when it is satisfied its met its goal
+    #https://thenewstack.io/vibe-coding-where-everyone-can-speak-computer-programming/ 
+    assistant_agent = AssistantAgent(
+        name="assistant_agent",
+        description="You are an agent that uses tools to read news.",
+        system_message=f"""Send the link to MultimodalWebSurfer agent.
+        {url}
+        Keep the summary under 200 characters. 
+        Determine three great hashtags and add them to the end of the summary.
+        Add the link to the end of the summary after the hashtags.
+        Then finally add a salutation and say this is from Jim's AI agent.
+        Add "TERMINATE" to message when you are done.
+        """,
+        model_client=AzureOpenAIChatCompletionClient(
+          name="Jim",
+          azure_deployment=os.getenv("OPENAI_API_BASE"),
+          model=os.getenv("OPENAI_MODEL_NAME"),
+          api_version="2024-08-01-preview",
+          azure_endpoint=os.getenv("OPENAI_API_BASE"),
+          api_key=os.getenv("AZURE_OPENAI_KEY"),
+      ),
+      )
+      
+    app.logger.info("An info message: Asst Agent was defined.")
+    
+    #The second team of agents then interface with X to send the tweet
+    #within autogen, when you use tools, first define your agents and then register
+    #them for tool use.  One agent will be able to initiate the use of the tool while the
+    #other agent will have permission to execute the tool
+    tool_caller = ConversableAgent(
+    name="Assistant",
+    system_message="""you receive a message from the user. 
+    Read the message and make sure it has a salutation from Jim's AI Agent.
+    If no message salutation exists, add a polite salutation from Jim's AI Agent.
+    Send the message into your tool 
+    then reply back with the tool response and 'TERMINATE'""",
+    llm_config={
+        "cache_seed": 41,  # seed for caching and reproducibility
+        "config_list": config_list,  # a list of OpenAI API configurations
+        "temperature": 0,  # temperature for sampling
+    },
+    )
+    
+    app.logger.info("An info message: tc was defined.")
+    
+    user_proxy = ConversableAgent(
+      name="User",
+      system_message="I will give you a message.",
+      llm_config={
+        "cache_seed": 41,  # seed for caching and reproducibility
+        "config_list": config_list,  # a list of OpenAI API configurations
+        "temperature": 0,  # temperature for sampling
+        },
+      #is_termination_msg=lambda msg: msg.get("content") is not None and "TERMINATE" in msg["content"],
+      human_input_mode="NEVER",
+    )
+    app.logger.info("An info message: ua was defined.")
+    
+    # Register the tool signature with the assistant agent.
+    tool_caller.register_for_llm(name="sendMsg", description="X integration")(sendMsg)
+    # Register the tool function with the user proxy agent.
+    user_proxy.register_for_execution(name="sendMsg")(sendMsg)  
+    app.logger.info("An info message: tool was registered.")    
+    
+    agent_team = RoundRobinGroupChat([assistant_agent,web_surfer_agent], max_turns=3) #
+
+    app.logger.info("Executing the agent team in stream.")
+    try:
+      async for message in agent_team.run_stream(task=f"""Web surfer agent should 
+      navigate to this site,
+      {url}
+      summarize it, return the summary in short string variable"""):
+        app.logger.info("In async call to messages")
+        if type(message).__name__ == "TextMessage":
+          content = message.content
+          content = content.replace("TERMINATE","")
+          app.logger.info(content)
+        else:
+          app.logger.info(print(type(message).__name__))
+    except:
+      app.logger.info("Exception in async call to messages")
+    
+    await web_surfer_agent.close()
+
+    app.logger.info("Starting the tool caller chat group.")
+    
+    chat_result = user_proxy.initiate_chat(tool_caller,
+      message=content,
+      max_turns=3,
+      summary_method="reflection_with_llm",
+    )
+    autogen.runtime_logging.stop()
+  except:
+    app.logger.info("Main went into exception.")
+    
+#Simple route setup and we will retrieve one argument, a url, and pass it to the main
+@app.route('/sendMsg')
+async def index():
+  url = request.args.get("url")
+  # Run the asynchronous task concurrently
+  responseContent = await asyncio.create_task(main(url))  #create_task(main())  .run...
+  return "Request accepted, async task running in background so check X."
+   
+#asyncio.run(main())
+if __name__ == '__main__':
+   app.run(debug=True, use_reloader=False)
+
+
+
+    
+
+
+
